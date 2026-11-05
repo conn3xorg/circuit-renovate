@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    env:
+      PODMAN: sudo podman
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      # Podman in the host container needs a rootful, privileged container.
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+        run: ./up.sh
+      # A throwaway Forgejo beside the host, with a repository for Renovate
+      # to update. Its token is made here and lives only as long as the job,
+      # so CI needs no secret of its own.
+      - name: Start a Forgejo with a repository to update
+        working-directory: examples/local
+        run: |
+          ./forgejo.sh
+          . ./forgejo.env
+          echo "::add-mask::$FORGEJO_TOKEN"
+          echo "TF_VAR_endpoint=$FORGEJO_ENDPOINT" >> "$GITHUB_ENV"
+          echo "TF_VAR_token=$FORGEJO_TOKEN" >> "$GITHUB_ENV"
+      # The first apply pins the release before, so the second one is an
+      # upgrade: a new image pulled, the config checked with it, and the
+      # script pointed at it.
+      - name: Apply 44.219.0, then upgrade to the default release
+        working-directory: examples/local
+        run: |
+          conn3x init
+          conn3x apply -auto-approve -var renovate_version=44.219.0 -var image_digest=sha256:7ae452492cd2393dbb8d401c6a3e7569bb7e6b5a7d2783739a6e4af576fd248a
+          conn3x apply -auto-approve
+      - name: Plan again with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      # The token reaches the host write-only, so state holds none of it, and
+      # nothing Conn3x writes under .terraform does either. .terraform/modules
+      # is left out: it holds downloaded module code.
+      - name: Check the token stays out of state
+        working-directory: examples/local
+        run: |
+          test -s terraform.tfstate || { echo "No terraform.tfstate to check." >&2; exit 1; }
+          if grep -rqF --exclude-dir=modules -e "$TF_VAR_token" terraform.tfstate .terraform/; then
+            echo "The Forgejo token is in terraform.tfstate or under .terraform/." >&2
+            exit 1
+          fi
+      # Starts a run the way the timer does, and checks Renovate opened a pull
+      # request on the demo repository to move lodash off 4.17.20.
+      - name: Run Renovate, check its pull request
+        working-directory: examples/local
+        run: ./check.sh
+      # Restarting the container boots systemd again, so this checks the
+      # timer is enabled and a run after the restart still works.
+      - name: Restart the host, then run Renovate again
+        working-directory: examples/local
+        run: |
+          sudo podman restart circuit-renovate
+          for _ in $(seq 90); do
+            case $(sudo podman exec circuit-renovate systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          sudo podman exec circuit-renovate systemctl is-active renovate.timer
+          ./check.sh
+      - name: Plan again after the restart
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        run: ./down.sh
